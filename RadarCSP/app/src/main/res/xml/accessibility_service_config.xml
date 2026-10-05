@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- packageNames: só recebe eventos do app do Uber Driver.
+     Para outro app, troque o nome do pacote aqui e em TARGET_PACKAGES (RadarService.kt). -->
+<accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+    android:description="@string/accessibility_description"
+    android:accessibilityEventTypes="typeWindowStateChanged|typeWindowContentChanged"
+    android:accessibilityFeedbackType="feedbackGeneric"
+    android:packageNames="com.ubercab.driver"
+    android:canTakeScreenshot="true"
+    android:notificationTimeout="300" />
