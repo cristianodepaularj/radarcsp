@@ -32,10 +32,7 @@ internal enum class Rating(val label: String, val bg: Int, val fg: Int) {
 
 /**
  * Radar de corridas: quando o Uber Driver mostra uma oferta, tira uma captura da tela,
- * lê o texto (OCR no aparelho) e mostra uma faixa colorida no topo:
- *   VERMELHO  PÉSSIMA        abaixo de R$ 1,50/km
- *   AMARELO   MAIS OU MENOS  de R$ 1,50 a R$ 1,99/km
- *   VERDE     ÓTIMA          R$ 2,00/km ou mais
+ * lê o texto (OCR no aparelho) e mostra uma faixa colorida no topo.
  * Não toca em nada. A imagem é processada em memória e descartada.
  */
 class RadarService : AccessibilityService() {
@@ -47,8 +44,10 @@ class RadarService : AccessibilityService() {
     private var lastUberEvent = 0L
     private var lastDetectLog = -60_000L
     private var lastDiagLog = -60_000L
+    private var lastSummary = -60_000L
     private var lastOfferKey = ""
     private var busy = false
+    private var busySince = 0L
     private var misses = 0
     private var blanks = 0
 
@@ -58,11 +57,7 @@ class RadarService : AccessibilityService() {
 
     private val ticker = object : Runnable {
         override fun run() {
-            try {
-                tick()
-            } catch (e: Exception) {
-                busy = false
-            }
+            safeTick()
             handler.postDelayed(this, POLL_MS)
         }
     }
@@ -80,9 +75,22 @@ class RadarService : AccessibilityService() {
         if (pkg == null || pkg !in TARGET_PACKAGES) return
         val now = SystemClock.elapsedRealtime()
         lastUberEvent = now
-        if (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED && now - lastDetectLog > 30_000) {
-            RadarLog.add("Uber Driver detectado")
-            lastDetectLog = now
+        if (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
+            if (now - lastDetectLog > 30_000) {
+                RadarLog.add("Uber Driver detectado")
+                lastDetectLog = now
+            }
+            // Reage na hora quando o Uber abre uma janela (ex.: cartão de oferta)
+            handler.post { safeTick() }
+        }
+    }
+
+    private fun safeTick() {
+        try {
+            tick()
+        } catch (e: Exception) {
+            busy = false
+            logOnce("Erro: " + e.javaClass.simpleName)
         }
     }
 
@@ -92,6 +100,10 @@ class RadarService : AccessibilityService() {
             return
         }
         val now = SystemClock.elapsedRealtime()
+        if (busy && now - busySince > 8_000) {
+            busy = false
+            logOnce("Captura travada, reiniciando")
+        }
         if (now - lastUberEvent > ACTIVE_MS) {
             hideOverlay()
             return
@@ -102,47 +114,43 @@ class RadarService : AccessibilityService() {
             return
         }
         busy = true
-        try {
-            takeScreenshot(
-                Display.DEFAULT_DISPLAY,
-                ContextCompat.getMainExecutor(this),
-                object : AccessibilityService.TakeScreenshotCallback {
-                    override fun onSuccess(result: AccessibilityService.ScreenshotResult) {
-                        handleShot(result)
-                    }
-
-                    override fun onFailure(errorCode: Int) {
-                        busy = false
-                        logOnce("Falha na captura de tela (código $errorCode)")
-                    }
+        busySince = now
+        takeScreenshot(
+            Display.DEFAULT_DISPLAY,
+            ContextCompat.getMainExecutor(this),
+            object : AccessibilityService.TakeScreenshotCallback {
+                override fun onSuccess(result: AccessibilityService.ScreenshotResult) {
+                    handleShot(result)
                 }
-            )
-        } catch (e: Exception) {
-            busy = false
-            logOnce("Erro ao capturar a tela")
-        }
+
+                override fun onFailure(errorCode: Int) {
+                    busy = false
+                    logOnce("Falha na captura de tela (código $errorCode)")
+                }
+            }
+        )
     }
 
     private fun handleShot(result: AccessibilityService.ScreenshotResult) {
-        var decoded: Bitmap? = null
-        val buffer = result.hardwareBuffer
         try {
-            val hw = Bitmap.wrapHardwareBuffer(buffer, result.colorSpace)
-            if (hw != null) {
-                decoded = hw.copy(Bitmap.Config.ARGB_8888, false)
-                hw.recycle()
+            var decoded: Bitmap? = null
+            val buffer = result.hardwareBuffer
+            try {
+                val hw = Bitmap.wrapHardwareBuffer(buffer, result.colorSpace)
+                if (hw != null) {
+                    decoded = hw.copy(Bitmap.Config.ARGB_8888, false)
+                    hw.recycle()
+                }
+            } finally {
+                buffer.close()
             }
-        } catch (_: Exception) {
-        } finally {
-            buffer.close()
-        }
-        val full = decoded
-        if (full == null) {
-            busy = false
-            return
-        }
-        try {
-            // Lê só a parte de baixo da tela (onde fica o cartão); a faixa colorida fica no topo
+            val full = decoded
+            if (full == null) {
+                busy = false
+                logOnce("Captura sem imagem")
+                return
+            }
+            // Lê a parte de baixo da tela (onde fica o cartão); a faixa colorida fica no topo
             val top = (full.height * CROP_TOP).toInt()
             val cropped = Bitmap.createBitmap(full, 0, top, full.width, full.height - top)
             full.recycle()
@@ -150,7 +158,11 @@ class RadarService : AccessibilityService() {
                 .addOnSuccessListener { r ->
                     cropped.recycle()
                     busy = false
-                    onText(r.text)
+                    try {
+                        onText(r.text)
+                    } catch (e: Exception) {
+                        logOnce("Erro na análise: " + e.javaClass.simpleName)
+                    }
                 }
                 .addOnFailureListener {
                     cropped.recycle()
@@ -159,7 +171,7 @@ class RadarService : AccessibilityService() {
                 }
         } catch (e: Exception) {
             busy = false
-            logOnce("Erro ao processar a imagem")
+            logOnce("Erro ao processar a imagem: " + e.javaClass.simpleName)
         }
     }
 
@@ -175,6 +187,7 @@ class RadarService : AccessibilityService() {
 
         val offer = OfferTextParser.parse(text)
         if (offer == null) {
+            summary(text, "oferta não reconhecida")
             misses++
             if (misses >= MISSES_TO_HIDE) hideOverlay()
             return
@@ -190,6 +203,27 @@ class RadarService : AccessibilityService() {
             val priceText = offer.price?.let { money(it) } ?: "R$ ?"
             RadarLog.add("Oferta: $priceText • ${perKmText(offer.perKm)} • ${rating.label}")
         }
+    }
+
+    /** Diagnóstico: só tokens com número e palavras-chave (sem nomes de ruas). */
+    private fun summary(text: String, note: String) {
+        val now = SystemClock.elapsedRealtime()
+        if (now - lastSummary < 8_000) return
+        lastSummary = now
+        RadarLog.add("Leitura (${text.length} car.): $note | ${digest(text)}")
+    }
+
+    private fun digest(text: String): String {
+        val keep = ArrayList<String>()
+        for (tok in text.split(Regex("\\s+"))) {
+            if (tok.isEmpty()) continue
+            val low = tok.lowercase()
+            if (tok.any { it.isDigit() } || low.startsWith("r\$") || low == "km" ||
+                low.startsWith("min") || low.startsWith("aceit") || low.startsWith("selec") ||
+                low.startsWith("inclu")
+            ) keep.add(tok)
+        }
+        return keep.joinToString(" ").take(220)
     }
 
     private fun rate(perKm: Double): Rating {
@@ -303,7 +337,7 @@ class RadarService : AccessibilityService() {
         val TARGET_PACKAGES = setOf("com.ubercab.driver")
         const val POLL_MS = 1200L          // intervalo entre capturas
         const val ACTIVE_MS = 12_000L      // só captura enquanto o Uber teve atividade recente
-        const val CROP_TOP = 0.35f         // ignora os 35% de cima da tela
+        const val CROP_TOP = 0.25f         // ignora os 25% de cima da tela
         const val MISSES_TO_HIDE = 2
 
         // >>> Limites das cores (R$ por km). Altere aqui se quiser. <<<
