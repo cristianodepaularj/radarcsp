@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Radar de Corridas</string>
+    <string name="accessibility_description">Usa a captura de tela do Android para ler a oferta exibida pelo app do Uber Driver e mostrar uma faixa colorida de avaliação (valor por km). Não toca em nada, não grava imagens e não envia dados para a internet.</string>
+</resources>
